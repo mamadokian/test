@@ -3,18 +3,22 @@
 GitHub Branch Sync Tool
 Compares branches between two repos and syncs missing ones from repo1 to repo2.
 Optimized for repositories with large numbers of branches (100k+).
+Now saves results to files.
 """
 
 import requests
 import sys
 import argparse
+import json
 import time
+import os
 from typing import Set, List, Dict, Optional
 from urllib.parse import urljoin
+from datetime import datetime
 
 
 class GitHubBranchSync:
-    def __init__(self, token: Optional[str] = None):
+    def __init__(self, token: Optional[str] = None, output_dir: str = "."):
         self.base_url = "https://api.github.com"
         self.session = requests.Session()
         self.session.headers.update({
@@ -26,6 +30,16 @@ class GitHubBranchSync:
         
         self.rate_limit_remaining = 5000
         self.rate_limit_reset = 0
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+    def _save_json(self, filename: str, data: dict):
+        """Save data to a JSON file in the output directory."""
+        filepath = os.path.join(self.output_dir, filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print(f"  💾 Saved to {filepath}")
+        return filepath
 
     def _check_rate_limit(self, response: requests.Response):
         """Update rate limit tracking from response headers."""
@@ -92,6 +106,18 @@ class GitHubBranchSync:
                 raise
         
         print(f"Total branches in {owner}/{repo}: {len(branches)}")
+        
+        # Save branches to file
+        self._save_json(
+            f"{owner}_{repo}_branches.json",
+            {
+                "repository": f"{owner}/{repo}",
+                "total_count": len(branches),
+                "branches": sorted(list(branches)),
+                "fetched_at": datetime.utcnow().isoformat() + "Z"
+            }
+        )
+        
         return branches
 
     def get_all_branches_graphql(self, owner: str, repo: str) -> Set[str]:
@@ -165,6 +191,19 @@ class GitHubBranchSync:
                 return self.get_all_branches(owner, repo)
         
         print(f"Total branches in {owner}/{repo}: {len(branches)}")
+        
+        # Save branches to file
+        self._save_json(
+            f"{owner}_{repo}_branches.json",
+            {
+                "repository": f"{owner}/{repo}",
+                "total_count": len(branches),
+                "branches": sorted(list(branches)),
+                "fetched_at": datetime.utcnow().isoformat() + "Z",
+                "method": "graphql"
+            }
+        )
+        
         return branches
 
     def branch_exists(self, owner: str, repo: str, branch: str) -> bool:
@@ -249,8 +288,25 @@ class GitHubBranchSync:
         missing = source_branches - target_branches
         stats["missing_branches"] = len(missing)
         
+        # Save missing branches to file
+        if missing:
+            self._save_json(
+                f"missing_branches_{source_owner}_{source_repo}_to_{target_owner}_{target_repo}.json",
+                {
+                    "source": f"{source_owner}/{source_repo}",
+                    "target": f"{target_owner}/{target_repo}",
+                    "missing_count": len(missing),
+                    "missing_branches": sorted(list(missing)),
+                    "generated_at": datetime.utcnow().isoformat() + "Z"
+                }
+            )
+        
         if not missing:
             print("\n✓ All branches are already in sync!")
+            self._save_json(
+                f"sync_result_{source_owner}_{source_repo}_to_{target_owner}_{target_repo}.json",
+                {**stats, "status": "already_in_sync", "timestamp": datetime.utcnow().isoformat() + "Z"}
+            )
             return stats
         
         print(f"\nFound {len(missing)} branches to sync from {source_owner}/{source_repo} to {target_owner}/{target_repo}")
@@ -259,15 +315,22 @@ class GitHubBranchSync:
             print("\n[DRY RUN] Would create the following branches:")
             for branch in sorted(missing):
                 print(f"  - {branch}")
+            
+            self._save_json(
+                f"sync_result_{source_owner}_{source_repo}_to_{target_owner}_{target_repo}.json",
+                {**stats, "status": "dry_run", "timestamp": datetime.utcnow().isoformat() + "Z"}
+            )
             return stats
         
         # Get default branch SHA from source to use as base for new branches
-        # You might want to modify this to get per-branch SHAs if branches diverge
         default_branch = self._get_default_branch(source_owner, source_repo)
         print(f"Using default branch '{default_branch}' as reference for new branches")
         
         # Create missing branches in target
         print("\nSyncing branches...")
+        created_branches = []
+        failed_branches = []
+        
         for i, branch in enumerate(sorted(missing), 1):
             print(f"[{i}/{len(missing)}] Processing: {branch}")
             
@@ -277,17 +340,33 @@ class GitHubBranchSync:
             if not source_sha:
                 print(f"  ✗ Could not get SHA for source branch {branch}, skipping...")
                 stats["skipped"] += 1
+                failed_branches.append({"branch": branch, "reason": "sha_not_found"})
                 continue
             
             # Create branch in target
             success = self.create_branch(target_owner, target_repo, branch, source_sha)
             if success:
                 stats["created"] += 1
+                created_branches.append(branch)
             else:
                 stats["failed"] += 1
+                failed_branches.append({"branch": branch, "reason": "api_error"})
             
             # Small delay to avoid hitting rate limits too hard
             time.sleep(0.1)
+        
+        # Save final results
+        self._save_json(
+            f"sync_result_{source_owner}_{source_repo}_to_{target_owner}_{target_repo}.json",
+            {
+                "source": f"{source_owner}/{source_repo}",
+                "target": f"{target_owner}/{target_repo}",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "stats": stats,
+                "created_branches": created_branches,
+                "failed_branches": failed_branches
+            }
+        )
         
         return stats
 
@@ -338,6 +417,11 @@ def main():
         default=100,
         help="Number of branches per page (max 100, default 100)"
     )
+    parser.add_argument(
+        "--output-dir", "-o",
+        default=".",
+        help="Directory to save result files (default: current directory)"
+    )
     
     args = parser.parse_args()
     
@@ -346,7 +430,7 @@ def main():
     target_owner, target_repo = parse_repo_string(args.target)
     
     # Initialize sync tool
-    sync = GitHubBranchSync(token=args.token)
+    sync = GitHubBranchSync(token=args.token, output_dir=args.output_dir)
     
     print("=" * 60)
     print("GitHub Branch Sync Tool")
@@ -355,6 +439,7 @@ def main():
     print(f"Target: {target_owner}/{target_repo}")
     print(f"Mode: {'GraphQL' if args.graphql else 'REST API'}")
     print(f"Dry Run: {'Yes' if args.dry_run else 'No'}")
+    print(f"Output Dir: {args.output_dir}")
     if not args.token:
         print("Warning: No token provided. Rate limit is 60 requests/hour for public repos.")
     print("=" * 60)
