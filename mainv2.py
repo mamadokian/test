@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Single-File Branch Sync - with missing_branches JSON support
+Concurrent Lua Branch Sync
+Downloads {branch}.lua from source and uploads to target using thread pool.
 """
 
 import requests
@@ -10,12 +11,14 @@ import time
 import os
 import sys
 import argparse
-from typing import Set, Optional
+import concurrent.futures
+import threading
+from typing import Set, Optional, List
 from datetime import datetime
 
 
 class LuaBranchSync:
-    def __init__(self, token: str, output_dir: str = ".", cache_hours: int = 24):
+    def __init__(self, token: str, output_dir: str = ".", cache_hours: int = 24, workers: int = 50):
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/vnd.github.v3+json",
@@ -24,9 +27,11 @@ class LuaBranchSync:
         })
         self.output_dir = output_dir
         self.cache_hours = cache_hours
+        self.workers = workers
         os.makedirs(output_dir, exist_ok=True)
         
         self.progress_file = os.path.join(output_dir, "lua_sync_progress.json")
+        self.lock = threading.Lock()
         self.rate_limit_remaining = 5000
 
     def _sleep_for_rate_limit(self, response: requests.Response):
@@ -80,8 +85,9 @@ class LuaBranchSync:
         return {"completed": [], "failed": []}
 
     def save_progress(self, progress: dict):
-        with open(self.progress_file, "w") as f:
-            json.dump(progress, f, indent=2)
+        with self.lock:
+            with open(self.progress_file, "w") as f:
+                json.dump(progress, f, indent=2)
 
     def load_branch_cache(self, owner: str, repo: str) -> Optional[Set[str]]:
         path = os.path.join(self.output_dir, f"{owner}_{repo}_branches.json")
@@ -127,7 +133,6 @@ class LuaBranchSync:
         return cached if cached is not None else self.fetch_branches(owner, repo)
 
     def load_missing_branches(self, filepath: str) -> Set[str]:
-        """Load missing branches directly from the saved JSON file."""
         print(f"Loading missing branches from {filepath}...")
         with open(filepath, "r") as f:
             data = json.load(f)
@@ -141,7 +146,6 @@ class LuaBranchSync:
         resp = self._get(url, {"ref": branch})
         
         if resp.status_code == 404:
-            print(f"    ⚠ File {path} not found on branch {branch}")
             return None
         
         data = resp.json()
@@ -163,7 +167,10 @@ class LuaBranchSync:
         return ref.json()["object"]["sha"]
 
     def branch_exists(self, owner: str, repo: str, branch: str) -> bool:
-        resp = self.session.get(f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}")
+        resp = self.session.get(
+            f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}",
+            timeout=10
+        )
         return resp.status_code == 200
 
     def create_branch(self, owner: str, repo: str, branch: str, base_sha: str) -> bool:
@@ -175,7 +182,6 @@ class LuaBranchSync:
             return True
         if resp.status_code == 422 and "already exists" in resp.text:
             return True
-        print(f"    ✗ Failed to create branch: {resp.status_code} {resp.text[:100]}")
         return False
 
     def upload_lua(self, owner: str, repo: str, branch: str, content_b64: str) -> bool:
@@ -196,42 +202,51 @@ class LuaBranchSync:
             payload["sha"] = existing_sha
         
         resp = self._put(url, payload)
-        
-        if resp.status_code in (200, 201):
-            return True
-        
-        print(f"    ✗ Upload failed: {resp.status_code} {resp.text[:100]}")
-        return False
+        return resp.status_code in (200, 201)
 
-    def sync_branch(self, src_owner: str, src_repo: str, tgt_owner: str, tgt_repo: str, 
-                    branch: str, tgt_base_sha: str) -> bool:
-        print(f"  📥 {branch}.lua")
-        content = self.get_lua_content(src_owner, src_repo, branch)
-        if content is None:
-            return False
+    def sync_one_branch(self, args: tuple) -> tuple:
+        """
+        Worker function for thread pool.
+        Returns: (branch_name, success: bool)
+        """
+        src_owner, src_repo, tgt_owner, tgt_repo, branch, tgt_base_sha = args
         
-        print(f"  🌿 Ensuring branch {branch}")
-        if not self.branch_exists(tgt_owner, tgt_repo, branch):
-            if not self.create_branch(tgt_owner, tgt_repo, branch, tgt_base_sha):
-                return False
-        
-        print(f"  📤 Uploading {branch}.lua")
-        return self.upload_lua(tgt_owner, tgt_repo, branch, content)
+        try:
+            # 1. Download .lua from source
+            content = self.get_lua_content(src_owner, src_repo, branch)
+            if content is None:
+                print(f"  ✗ {branch}: .lua file not found in source")
+                return branch, False
+            
+            # 2. Ensure branch exists in target
+            if not self.branch_exists(tgt_owner, tgt_repo, branch):
+                if not self.create_branch(tgt_owner, tgt_repo, branch, tgt_base_sha):
+                    print(f"  ✗ {branch}: failed to create branch")
+                    return branch, False
+            
+            # 3. Upload to target
+            if not self.upload_lua(tgt_owner, tgt_repo, branch, content):
+                print(f"  ✗ {branch}: upload failed")
+                return branch, False
+            
+            print(f"  ✓ {branch}")
+            return branch, True
+            
+        except Exception as e:
+            print(f"  ✗ {branch}: {e}")
+            return branch, False
 
     def run(self, source: str, target: str, missing_file: str = None, dry_run: bool = False):
         src_owner, src_repo = source.split("/")
         tgt_owner, tgt_repo = target.split("/")
         
-        # Determine which branches to sync
+        # Determine branches to sync
         if missing_file:
-            # Use the provided missing_branches JSON directly
             missing = sorted(self.load_missing_branches(missing_file))
             print(f"\n{'='*60}")
-            print(f"Using provided missing_branches file")
-            print(f"Branches to sync: {len(missing):,}")
+            print(f"Using missing_branches file: {len(missing):,} branches")
             print(f"{'='*60}\n")
         else:
-            # Compare repos via API/cache
             print(f"\n[Source] {source}")
             source_branches = self.get_branches(src_owner, src_repo)
             
@@ -240,9 +255,7 @@ class LuaBranchSync:
             
             missing = sorted(source_branches - target_branches)
             print(f"\n{'='*60}")
-            print(f"Source branches:  {len(source_branches):,}")
-            print(f"Target branches:  {len(target_branches):,}")
-            print(f"Missing:          {len(missing):,}")
+            print(f"Source: {len(source_branches):,} | Target: {len(target_branches):,} | Missing: {len(missing):,}")
             print(f"{'='*60}\n")
         
         if not missing:
@@ -250,7 +263,7 @@ class LuaBranchSync:
             return
         
         if dry_run:
-            print("[DRY RUN] Would sync:")
+            print(f"[DRY RUN] Would sync {len(missing)} branches with {self.workers} workers")
             for b in missing[:10]:
                 print(f"  - {b}.lua")
             if len(missing) > 10:
@@ -262,62 +275,107 @@ class LuaBranchSync:
         tgt_base_sha = self.get_default_branch_sha(tgt_owner, tgt_repo)
         print(f"  Base: {tgt_base_sha[:7]}...\n")
         
-        # Resume progress
+        # Load progress
         progress = self.load_progress()
         completed = set(progress.get("completed", []))
         failed = list(progress.get("failed", []))
         
         to_process = [b for b in missing if b not in completed]
-        print(f"Resume: {len(completed)} done, {len(to_process)} remaining\n")
+        print(f"Resume: {len(completed)} done, {len(to_process)} remaining")
+        print(f"Workers: {self.workers}\n")
+        
+        # Build arg tuples for workers
+        worker_args = [
+            (src_owner, src_repo, tgt_owner, tgt_repo, branch, tgt_base_sha)
+            for branch in to_process
+        ]
+        
+        completed_new = 0
+        failed_new = 0
+        processed_since_save = 0
         
         try:
-            for i, branch in enumerate(to_process, 1):
-                print(f"[{i}/{len(to_process)}] {branch}")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                future_to_branch = {
+                    executor.submit(self.sync_one_branch, args): args[4] 
+                    for args in worker_args
+                }
                 
-                ok = self.sync_branch(src_owner, src_repo, tgt_owner, tgt_repo, 
-                                      branch, tgt_base_sha)
-                
-                if ok:
-                    completed.add(branch)
-                    print(f"  ✓ Done")
-                else:
-                    failed.append(branch)
-                    print(f"  ✗ Failed")
-                
-                if i % 5 == 0:
-                    self.save_progress({"completed": sorted(list(completed)), "failed": failed})
-                    print(f"  💾 Saved progress")
-                
-                print()
-                
+                for future in concurrent.futures.as_completed(future_to_branch):
+                    branch = future_to_branch[future]
+                    try:
+                        _, success = future.result()
+                    except Exception as e:
+                        print(f"  ✗ {branch}: Exception - {e}")
+                        success = False
+                    
+                    with self.lock:
+                        if success:
+                            completed.add(branch)
+                            completed_new += 1
+                        else:
+                            failed.append(branch)
+                            failed_new += 1
+                        
+                        processed_since_save += 1
+                        
+                        # Save progress every 50 branches
+                        if processed_since_save >= 50:
+                            self.save_progress({
+                                "completed": sorted(list(completed)), 
+                                "failed": failed
+                            })
+                            print(f"  💾 Progress saved ({len(completed)}/{len(missing)} total done)")
+                            processed_since_save = 0
+                        
         except KeyboardInterrupt:
-            print("\n\n⚠ Interrupted. Saving progress...")
+            print("\n\n⚠ Interrupted by user.")
         finally:
-            self.save_progress({"completed": sorted(list(completed)), "failed": failed})
+            self.save_progress({
+                "completed": sorted(list(completed)), 
+                "failed": failed
+            })
         
         print(f"\n{'='*60}")
         print("DONE")
-        print(f"Completed: {len(completed)}")
-        print(f"Failed:    {len(failed)}")
-        print(f"Progress:  {self.progress_file}")
+        print(f"Total completed: {len(completed)}")
+        print(f"Total failed:    {len(failed)}")
+        print(f"This run:        +{completed_new} done, +{failed_new} failed")
+        print(f"Progress:        {self.progress_file}")
         print(f"{'='*60}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sync .lua files from source branches to target repo."
+        description="Concurrent .lua branch sync. Downloads {branch}.lua and uploads to target."
     )
     parser.add_argument("source", help="Source repo (owner/repo)")
     parser.add_argument("target", help="Target repo (owner/repo)")
     parser.add_argument("--token", "-t", required=True, help="GitHub token")
-    parser.add_argument("--missing-file", "-m", help="Path to missing_branches JSON from previous run (skips repo comparison)")
+    parser.add_argument("--missing-file", "-m", help="Path to missing_branches JSON (skips repo comparison)")
     parser.add_argument("--output-dir", "-o", default=".", help="Cache/progress directory")
     parser.add_argument("--dry-run", "-d", action="store_true", help="Preview only")
     parser.add_argument("--cache-hours", "-c", type=int, default=24, help="Branch cache max age")
+    parser.add_argument("--workers", "-w", type=int, default=50, help="Concurrent threads (default: 50)")
     
     args = parser.parse_args()
     
-    sync = LuaBranchSync(token=args.token, output_dir=args.output_dir, cache_hours=args.cache_hours)
+    sync = LuaBranchSync(
+        token=args.token, 
+        output_dir=args.output_dir, 
+        cache_hours=args.cache_hours,
+        workers=args.workers
+    )
+    
+    print("=" * 60)
+    print("Concurrent Lua Branch Sync")
+    print("=" * 60)
+    print(f"Source:  {args.source}")
+    print(f"Target:  {args.target}")
+    print(f"Workers: {args.workers}")
+    print(f"Cache:   {args.cache_hours}h")
+    print(f"{'='*60}")
+    
     sync.run(args.source, args.target, missing_file=args.missing_file, dry_run=args.dry_run)
 
 
