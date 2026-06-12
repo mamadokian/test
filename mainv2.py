@@ -1,443 +1,324 @@
 #!/usr/bin/env python3
 """
-GitHub Branch Sync Tool - CACHE-FIRST VERSION
-Reads saved branch lists from JSON first. Only hits the API if cache is missing or expired.
+Single-File Branch Sync - with missing_branches JSON support
 """
 
 import requests
-import sys
-import argparse
+import base64
 import json
 import time
 import os
-from typing import Set, List, Dict, Optional
+import sys
+import argparse
+from typing import Set, Optional
 from datetime import datetime
 
 
-class GitHubBranchSync:
-    def __init__(self, token: Optional[str] = None, output_dir: str = ".", cache_max_age_hours: int = 24):
-        self.base_url = "https://api.github.com"
+class LuaBranchSync:
+    def __init__(self, token: str, output_dir: str = ".", cache_hours: int = 24):
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "BranchSyncTool/1.0"
+            "Authorization": f"token {token}",
+            "User-Agent": "LuaSync/1.0"
         })
-        if token:
-            self.session.headers["Authorization"] = f"token {token}"
-        
-        self.rate_limit_remaining = 5000
-        self.rate_limit_reset = 0
         self.output_dir = output_dir
-        self.cache_max_age_hours = cache_max_age_hours
+        self.cache_hours = cache_hours
         os.makedirs(output_dir, exist_ok=True)
-
-    def _get_cache_path(self, owner: str, repo: str) -> str:
-        return os.path.join(self.output_dir, f"{owner}_{repo}_branches.json")
-
-    def _save_json(self, filename: str, data: dict):
-        filepath = os.path.join(self.output_dir, filename)
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        print(f"  💾 Saved to {filepath}")
-        return filepath
-
-    def load_saved_branches(self, owner: str, repo: str) -> Optional[Set[str]]:
-        """Load branches from saved JSON if it exists and isn't too old."""
-        filepath = self._get_cache_path(owner, repo)
         
-        if not os.path.exists(filepath):
-            return None
-        
-        try:
-            mtime = os.path.getmtime(filepath)
-            age_hours = (time.time() - mtime) / 3600
-            
-            if age_hours > self.cache_max_age_hours:
-                print(f"  ⚠ Cache file is {age_hours:.1f}h old (max {self.cache_max_age_hours}h), refetching...")
-                return None
-            
-            print(f"  📂 Loading cached branches from {filepath}...")
-            with open(filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            
-            branches = set(data.get("branches", []))
-            print(f"  ✓ Loaded {len(branches)} branches from cache (age: {age_hours:.1f}h)")
-            return branches
-            
-        except (json.JSONDecodeError, KeyError, OSError) as e:
-            print(f"  ⚠ Failed to read cache: {e}, refetching...")
-            return None
+        self.progress_file = os.path.join(output_dir, "lua_sync_progress.json")
+        self.rate_limit_remaining = 5000
 
-    def _check_rate_limit(self, response: requests.Response):
+    def _sleep_for_rate_limit(self, response: requests.Response):
         self.rate_limit_remaining = int(response.headers.get('X-RateLimit-Remaining', 0))
-        self.rate_limit_reset = int(response.headers.get('X-RateLimit-Reset', 0))
-        
-        if self.rate_limit_remaining < 10:
-            sleep_time = max(self.rate_limit_reset - time.time(), 0) + 1
-            print(f"Rate limit nearly exhausted. Sleeping for {sleep_time:.0f} seconds...")
-            time.sleep(sleep_time)
+        if self.rate_limit_remaining < 5:
+            reset = int(response.headers.get('X-RateLimit-Reset', time.time() + 60))
+            sleep = max(reset - time.time(), 0) + 2
+            print(f"  ⏳ Rate limit low ({self.rate_limit_remaining}). Sleeping {sleep:.0f}s...")
+            time.sleep(sleep)
 
-    def _get(self, url: str, params: Dict = None) -> requests.Response:
-        response = self.session.get(url, params=params or {}, timeout=30)
-        self._check_rate_limit(response)
-        
-        if response.status_code == 403 and 'rate limit' in response.text.lower():
-            retry_after = int(response.headers.get('Retry-After', 60))
-            print(f"Rate limited. Waiting {retry_after} seconds...")
-            time.sleep(retry_after)
-            return self._get(url, params)
-        
-        response.raise_for_status()
-        return response
+    def _get(self, url: str, params: dict = None) -> requests.Response:
+        while True:
+            resp = self.session.get(url, params=params or {}, timeout=30)
+            self._sleep_for_rate_limit(resp)
+            
+            if resp.status_code == 403 and 'rate limit' in resp.text.lower():
+                reset = int(resp.headers.get('X-RateLimit-Reset', time.time() + 60))
+                time.sleep(max(reset - time.time(), 0) + 1)
+                continue
+            if resp.status_code == 404:
+                return resp
+            resp.raise_for_status()
+            return resp
 
-    def get_all_branches(self, owner: str, repo: str, per_page: int = 100) -> Set[str]:
+    def _post(self, url: str, json_data: dict) -> requests.Response:
+        while True:
+            resp = self.session.post(url, json=json_data, timeout=30)
+            self._sleep_for_rate_limit(resp)
+            
+            if resp.status_code == 403 and 'rate limit' in resp.text.lower():
+                reset = int(resp.headers.get('X-RateLimit-Reset', time.time() + 60))
+                time.sleep(max(reset - time.time(), 0) + 1)
+                continue
+            return resp
+
+    def _put(self, url: str, json_data: dict) -> requests.Response:
+        while True:
+            resp = self.session.put(url, json=json_data, timeout=30)
+            self._sleep_for_rate_limit(resp)
+            
+            if resp.status_code == 403 and 'rate limit' in resp.text.lower():
+                reset = int(resp.headers.get('X-RateLimit-Reset', time.time() + 60))
+                time.sleep(max(reset - time.time(), 0) + 1)
+                continue
+            return resp
+
+    def load_progress(self) -> dict:
+        if os.path.exists(self.progress_file):
+            with open(self.progress_file, "r") as f:
+                return json.load(f)
+        return {"completed": [], "failed": []}
+
+    def save_progress(self, progress: dict):
+        with open(self.progress_file, "w") as f:
+            json.dump(progress, f, indent=2)
+
+    def load_branch_cache(self, owner: str, repo: str) -> Optional[Set[str]]:
+        path = os.path.join(self.output_dir, f"{owner}_{repo}_branches.json")
+        if not os.path.exists(path):
+            return None
+        if (time.time() - os.path.getmtime(path)) / 3600 > self.cache_hours:
+            return None
+        with open(path, "r") as f:
+            return set(json.load(f).get("branches", []))
+
+    def fetch_branches(self, owner: str, repo: str) -> Set[str]:
         branches = set()
         page = 1
-        
-        print(f"Fetching branches from {owner}/{repo} via API...")
+        print(f"Fetching branches from {owner}/{repo}...")
         
         while True:
-            url = f"{self.base_url}/repos/{owner}/{repo}/branches"
-            params = {"per_page": per_page, "page": page}
-            
-            try:
-                response = self._get(url, params)
-                data = response.json()
-                
-                if not data:
-                    break
-                
-                for branch in data:
-                    branches.add(branch['name'])
-                
-                if len(data) < per_page:
-                    break
-                
-                page += 1
-                
-                if page % 10 == 0:
-                    print(f"  ... fetched {len(branches)} branches so far (page {page})")
-                    
-            except requests.exceptions.RequestException as e:
-                print(f"Error fetching page {page}: {e}")
-                raise
+            resp = self._get(f"https://api.github.com/repos/{owner}/{repo}/branches", 
+                           {"per_page": 100, "page": page})
+            data = resp.json()
+            if not data:
+                break
+            for b in data:
+                branches.add(b["name"])
+            if len(data) < 100:
+                break
+            page += 1
+            if page % 10 == 0:
+                print(f"  ... {len(branches)} branches")
         
-        print(f"Total branches fetched from API: {len(branches)}")
-        
-        self._save_json(
-            f"{owner}_{repo}_branches.json",
-            {
+        with open(os.path.join(self.output_dir, f"{owner}_{repo}_branches.json"), "w") as f:
+            json.dump({
                 "repository": f"{owner}/{repo}",
                 "total_count": len(branches),
                 "branches": sorted(list(branches)),
-                "fetched_at": datetime.utcnow().isoformat() + "Z",
-                "method": "rest_api"
-            }
-        )
+                "fetched_at": datetime.utcnow().isoformat() + "Z"
+            }, f, indent=2)
         
+        print(f"  ✓ Cached {len(branches)} branches")
         return branches
 
-    def get_all_branches_graphql(self, owner: str, repo: str) -> Set[str]:
-        if "Authorization" not in self.session.headers:
-            print("No token provided, falling back to REST API...")
-            return self.get_all_branches(owner, repo)
-        
-        branches = set()
-        cursor = None
-        
-        query = """
-        query($owner: String!, $repo: String!, $cursor: String) {
-            repository(owner: $owner, name: $repo) {
-                refs(refPrefix: "refs/heads/", first: 100, after: $cursor) {
-                    pageInfo {
-                        hasNextPage
-                        endCursor
-                    }
-                    nodes {
-                        name
-                    }
-                }
-            }
-        }
-        """
-        
-        print(f"Fetching branches from {owner}/{repo} via GraphQL...")
-        
-        while True:
-            variables = {
-                "owner": owner,
-                "repo": repo,
-                "cursor": cursor
-            }
-            
-            try:
-                response = self.session.post(
-                    "https://api.github.com/graphql",
-                    json={"query": query, "variables": variables}
-                )
-                self._check_rate_limit(response)
-                response.raise_for_status()
-                
-                data = response.json()
-                
-                if 'errors' in data:
-                    print(f"GraphQL errors: {data['errors']}")
-                    print("Falling back to REST API...")
-                    return self.get_all_branches(owner, repo)
-                
-                refs = data['data']['repository']['refs']
-                
-                for node in refs['nodes']:
-                    branches.add(node['name'])
-                
-                if not refs['pageInfo']['hasNextPage']:
-                    break
-                
-                cursor = refs['pageInfo']['endCursor']
-                
-                if len(branches) % 1000 == 0:
-                    print(f"  ... fetched {len(branches)} branches so far")
-                    
-            except requests.exceptions.RequestException as e:
-                print(f"GraphQL error: {e}, falling back to REST API...")
-                return self.get_all_branches(owner, repo)
-        
-        print(f"Total branches fetched via GraphQL: {len(branches)}")
-        
-        self._save_json(
-            f"{owner}_{repo}_branches.json",
-            {
-                "repository": f"{owner}/{repo}",
-                "total_count": len(branches),
-                "branches": sorted(list(branches)),
-                "fetched_at": datetime.utcnow().isoformat() + "Z",
-                "method": "graphql"
-            }
-        )
-        
+    def get_branches(self, owner: str, repo: str) -> Set[str]:
+        cached = self.load_branch_cache(owner, repo)
+        return cached if cached is not None else self.fetch_branches(owner, repo)
+
+    def load_missing_branches(self, filepath: str) -> Set[str]:
+        """Load missing branches directly from the saved JSON file."""
+        print(f"Loading missing branches from {filepath}...")
+        with open(filepath, "r") as f:
+            data = json.load(f)
+        branches = set(data.get("missing_branches", []))
+        print(f"  ✓ Loaded {len(branches)} missing branches")
         return branches
+
+    def get_lua_content(self, owner: str, repo: str, branch: str) -> Optional[str]:
+        path = f"{branch}.lua"
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+        resp = self._get(url, {"ref": branch})
+        
+        if resp.status_code == 404:
+            print(f"    ⚠ File {path} not found on branch {branch}")
+            return None
+        
+        data = resp.json()
+        
+        if data.get("encoding") == "base64" and data.get("content"):
+            return data["content"].replace("\n", "")
+        
+        if data.get("download_url"):
+            raw = self.session.get(data["download_url"], timeout=30)
+            raw.raise_for_status()
+            return base64.b64encode(raw.content).decode()
+        
+        return None
 
     def get_default_branch_sha(self, owner: str, repo: str) -> str:
-        url = f"{self.base_url}/repos/{owner}/{repo}"
-        response = self._get(url)
-        default_branch = response.json().get('default_branch', 'main')
-        
-        ref_url = f"{self.base_url}/repos/{owner}/{repo}/git/ref/heads/{default_branch}"
-        ref_response = self._get(ref_url)
-        sha = ref_response.json()['object']['sha']
-        
-        print(f"Target default branch: {default_branch} @ {sha[:7]}...")
-        return sha
+        resp = self._get(f"https://api.github.com/repos/{owner}/{repo}")
+        default = resp.json().get("default_branch", "main")
+        ref = self._get(f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default}")
+        return ref.json()["object"]["sha"]
 
-    def create_branch(self, owner: str, repo: str, branch_name: str, base_sha: str) -> bool:
-        url = f"{self.base_url}/repos/{owner}/{repo}/git/refs"
+    def branch_exists(self, owner: str, repo: str, branch: str) -> bool:
+        resp = self.session.get(f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}")
+        return resp.status_code == 200
+
+    def create_branch(self, owner: str, repo: str, branch: str, base_sha: str) -> bool:
+        resp = self._post(
+            f"https://api.github.com/repos/{owner}/{repo}/git/refs",
+            {"ref": f"refs/heads/{branch}", "sha": base_sha}
+        )
+        if resp.status_code == 201:
+            return True
+        if resp.status_code == 422 and "already exists" in resp.text:
+            return True
+        print(f"    ✗ Failed to create branch: {resp.status_code} {resp.text[:100]}")
+        return False
+
+    def upload_lua(self, owner: str, repo: str, branch: str, content_b64: str) -> bool:
+        path = f"{branch}.lua"
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+        
+        existing_sha = None
+        check = self.session.get(url, params={"ref": branch}, timeout=10)
+        if check.status_code == 200:
+            existing_sha = check.json().get("sha")
+        
         payload = {
-            "ref": f"refs/heads/{branch_name}",
-            "sha": base_sha
+            "message": f"Add {path}",
+            "content": content_b64,
+            "branch": branch
         }
+        if existing_sha:
+            payload["sha"] = existing_sha
         
-        try:
-            response = self.session.post(url, json=payload)
-            self._check_rate_limit(response)
-            
-            if response.status_code == 201:
-                print(f"  ✓ Created branch: {branch_name}")
-                return True
-            elif response.status_code == 422 and 'already exists' in response.text:
-                print(f"  ⚠ Branch already exists: {branch_name}")
-                return True
-            else:
-                print(f"  ✗ Failed to create {branch_name}: {response.status_code} - {response.text}")
-                return False
-                
-        except requests.exceptions.RequestException as e:
-            print(f"  ✗ Error creating {branch_name}: {e}")
+        resp = self._put(url, payload)
+        
+        if resp.status_code in (200, 201):
+            return True
+        
+        print(f"    ✗ Upload failed: {resp.status_code} {resp.text[:100]}")
+        return False
+
+    def sync_branch(self, src_owner: str, src_repo: str, tgt_owner: str, tgt_repo: str, 
+                    branch: str, tgt_base_sha: str) -> bool:
+        print(f"  📥 {branch}.lua")
+        content = self.get_lua_content(src_owner, src_repo, branch)
+        if content is None:
             return False
-
-    def get_branches(self, owner: str, repo: str, use_graphql: bool = False) -> Set[str]:
-        """
-        CACHE-FIRST: Try to load from JSON file first.
-        Only hits the API if no valid cache exists.
-        """
-        cached = self.load_saved_branches(owner, repo)
-        if cached is not None:
-            return cached
         
-        if use_graphql:
-            return self.get_all_branches_graphql(owner, repo)
+        print(f"  🌿 Ensuring branch {branch}")
+        if not self.branch_exists(tgt_owner, tgt_repo, branch):
+            if not self.create_branch(tgt_owner, tgt_repo, branch, tgt_base_sha):
+                return False
+        
+        print(f"  📤 Uploading {branch}.lua")
+        return self.upload_lua(tgt_owner, tgt_repo, branch, content)
+
+    def run(self, source: str, target: str, missing_file: str = None, dry_run: bool = False):
+        src_owner, src_repo = source.split("/")
+        tgt_owner, tgt_repo = target.split("/")
+        
+        # Determine which branches to sync
+        if missing_file:
+            # Use the provided missing_branches JSON directly
+            missing = sorted(self.load_missing_branches(missing_file))
+            print(f"\n{'='*60}")
+            print(f"Using provided missing_branches file")
+            print(f"Branches to sync: {len(missing):,}")
+            print(f"{'='*60}\n")
         else:
-            return self.get_all_branches(owner, repo)
-
-    def sync_branches(
-        self,
-        source_owner: str,
-        source_repo: str,
-        target_owner: str,
-        target_repo: str,
-        dry_run: bool = False,
-        use_graphql: bool = False
-    ) -> Dict[str, any]:
-        stats = {
-            "source_branches": 0,
-            "target_branches": 0,
-            "missing_branches": 0,
-            "created": 0,
-            "failed": 0,
-            "skipped": 0
-        }
-        
-        # CACHE-FIRST: Load from JSON if available, else fetch from API
-        print(f"\n[Source] {source_owner}/{source_repo}")
-        source_branches = self.get_branches(source_owner, source_repo, use_graphql=use_graphql)
-        
-        print(f"\n[Target] {target_owner}/{target_repo}")
-        target_branches = self.get_branches(target_owner, target_repo, use_graphql=use_graphql)
-        
-        stats["source_branches"] = len(source_branches)
-        stats["target_branches"] = len(target_branches)
-        
-        # Find missing branches
-        missing = source_branches - target_branches
-        stats["missing_branches"] = len(missing)
-        
-        if missing:
-            self._save_json(
-                f"missing_branches_{source_owner}_{source_repo}_to_{target_owner}_{target_repo}.json",
-                {
-                    "source": f"{source_owner}/{source_repo}",
-                    "target": f"{target_owner}/{target_repo}",
-                    "missing_count": len(missing),
-                    "missing_branches": sorted(list(missing)),
-                    "generated_at": datetime.utcnow().isoformat() + "Z"
-                }
-            )
+            # Compare repos via API/cache
+            print(f"\n[Source] {source}")
+            source_branches = self.get_branches(src_owner, src_repo)
+            
+            print(f"\n[Target] {target}")
+            target_branches = self.get_branches(tgt_owner, tgt_repo)
+            
+            missing = sorted(source_branches - target_branches)
+            print(f"\n{'='*60}")
+            print(f"Source branches:  {len(source_branches):,}")
+            print(f"Target branches:  {len(target_branches):,}")
+            print(f"Missing:          {len(missing):,}")
+            print(f"{'='*60}\n")
         
         if not missing:
-            print("\n✓ All branches are already in sync!")
-            self._save_json(
-                f"sync_result_{source_owner}_{source_repo}_to_{target_owner}_{target_repo}.json",
-                {**stats, "status": "already_in_sync", "timestamp": datetime.utcnow().isoformat() + "Z"}
-            )
-            return stats
-        
-        print(f"\nFound {len(missing)} branches to sync from {source_owner}/{source_repo} to {target_owner}/{target_repo}")
-        
-        target_base_sha = self.get_default_branch_sha(target_owner, target_repo)
+            print("✓ Nothing to sync!")
+            return
         
         if dry_run:
-            print("\n[DRY RUN] Would create the following branches:")
-            for branch in sorted(missing):
-                print(f"  - {branch}")
-            
-            self._save_json(
-                f"sync_result_{source_owner}_{source_repo}_to_{target_owner}_{target_repo}.json",
-                {**stats, "status": "dry_run", "timestamp": datetime.utcnow().isoformat() + "Z"}
-            )
-            return stats
+            print("[DRY RUN] Would sync:")
+            for b in missing[:10]:
+                print(f"  - {b}.lua")
+            if len(missing) > 10:
+                print(f"  ... and {len(missing)-10} more")
+            return
         
-        print(f"\nSyncing branches (all pointing to {target_base_sha[:7]}...)")
-        created_branches = []
-        failed_branches = []
+        # Get target base SHA once
+        print("Getting target base SHA...")
+        tgt_base_sha = self.get_default_branch_sha(tgt_owner, tgt_repo)
+        print(f"  Base: {tgt_base_sha[:7]}...\n")
         
-        for i, branch in enumerate(sorted(missing), 1):
-            print(f"[{i}/{len(missing)}] Processing: {branch}")
-            
-            success = self.create_branch(target_owner, target_repo, branch, target_base_sha)
-            if success:
-                stats["created"] += 1
-                created_branches.append(branch)
-            else:
-                stats["failed"] += 1
-                failed_branches.append({"branch": branch, "reason": "api_error"})
-            
-            time.sleep(0.1)
+        # Resume progress
+        progress = self.load_progress()
+        completed = set(progress.get("completed", []))
+        failed = list(progress.get("failed", []))
         
-        self._save_json(
-            f"sync_result_{source_owner}_{source_repo}_to_{target_owner}_{target_repo}.json",
-            {
-                "source": f"{source_owner}/{source_repo}",
-                "target": f"{target_owner}/{target_repo}",
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "base_sha": target_base_sha,
-                "stats": stats,
-                "created_branches": created_branches,
-                "failed_branches": failed_branches
-            }
-        )
+        to_process = [b for b in missing if b not in completed]
+        print(f"Resume: {len(completed)} done, {len(to_process)} remaining\n")
         
-        return stats
-
-
-def parse_repo_string(repo_str: str) -> tuple:
-    parts = repo_str.split('/')
-    if len(parts) != 2:
-        raise ValueError(f"Invalid repo format '{repo_str}'. Expected 'owner/repo'.")
-    return parts[0], parts[1]
+        try:
+            for i, branch in enumerate(to_process, 1):
+                print(f"[{i}/{len(to_process)}] {branch}")
+                
+                ok = self.sync_branch(src_owner, src_repo, tgt_owner, tgt_repo, 
+                                      branch, tgt_base_sha)
+                
+                if ok:
+                    completed.add(branch)
+                    print(f"  ✓ Done")
+                else:
+                    failed.append(branch)
+                    print(f"  ✗ Failed")
+                
+                if i % 5 == 0:
+                    self.save_progress({"completed": sorted(list(completed)), "failed": failed})
+                    print(f"  💾 Saved progress")
+                
+                print()
+                
+        except KeyboardInterrupt:
+            print("\n\n⚠ Interrupted. Saving progress...")
+        finally:
+            self.save_progress({"completed": sorted(list(completed)), "failed": failed})
+        
+        print(f"\n{'='*60}")
+        print("DONE")
+        print(f"Completed: {len(completed)}")
+        print(f"Failed:    {len(failed)}")
+        print(f"Progress:  {self.progress_file}")
+        print(f"{'='*60}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sync missing branches from one GitHub repo to another. Reads cached JSON first, API only if needed."
+        description="Sync .lua files from source branches to target repo."
     )
-    parser.add_argument("source", help="Source repository (format: owner/repo)")
-    parser.add_argument("target", help="Target repository (format: owner/repo)")
-    parser.add_argument("--token", "-t", help="GitHub Personal Access Token")
-    parser.add_argument("--dry-run", "-d", action="store_true", help="Show what would be synced without making changes")
-    parser.add_argument("--graphql", "-g", action="store_true", help="Use GraphQL API")
-    parser.add_argument("--output-dir", "-o", default=".", help="Directory to save result files")
-    parser.add_argument("--cache-hours", "-c", type=int, default=24, help="Max age of cache files in hours before refetching (default: 24)")
+    parser.add_argument("source", help="Source repo (owner/repo)")
+    parser.add_argument("target", help="Target repo (owner/repo)")
+    parser.add_argument("--token", "-t", required=True, help="GitHub token")
+    parser.add_argument("--missing-file", "-m", help="Path to missing_branches JSON from previous run (skips repo comparison)")
+    parser.add_argument("--output-dir", "-o", default=".", help="Cache/progress directory")
+    parser.add_argument("--dry-run", "-d", action="store_true", help="Preview only")
+    parser.add_argument("--cache-hours", "-c", type=int, default=24, help="Branch cache max age")
     
     args = parser.parse_args()
     
-    source_owner, source_repo = parse_repo_string(args.source)
-    target_owner, target_repo = parse_repo_string(args.target)
-    
-    sync = GitHubBranchSync(token=args.token, output_dir=args.output_dir, cache_max_age_hours=args.cache_hours)
-    
-    print("=" * 60)
-    print("GitHub Branch Sync Tool (CACHE-FIRST)")
-    print("=" * 60)
-    print(f"Source: {source_owner}/{source_repo}")
-    print(f"Target: {target_owner}/{target_repo}")
-    print(f"Cache max age: {args.cache_hours} hours")
-    print(f"Mode: {'GraphQL' if args.graphql else 'REST API'}")
-    print(f"Dry Run: {'Yes' if args.dry_run else 'No'}")
-    print(f"Output Dir: {args.output_dir}")
-    if not args.token:
-        print("Warning: No token provided. Rate limit is 60 requests/hour.")
-    print("=" * 60)
-    
-    try:
-        stats = sync.sync_branches(
-            source_owner, source_repo,
-            target_owner, target_repo,
-            dry_run=args.dry_run,
-            use_graphql=args.graphql
-        )
-        
-        print("\n" + "=" * 60)
-        print("SYNC SUMMARY")
-        print("=" * 60)
-        print(f"Source branches:      {stats['source_branches']:,}")
-        print(f"Target branches:        {stats['target_branches']:,}")
-        print(f"Missing branches:     {stats['missing_branches']:,}")
-        if not args.dry_run:
-            print(f"Created:              {stats['created']:,}")
-            print(f"Failed:               {stats['failed']:,}")
-            print(f"Skipped:              {stats['skipped']:,}")
-        print("=" * 60)
-        
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 404:
-            print("\n✗ Error: Repository not found or not accessible.")
-        elif e.response.status_code == 401:
-            print("\n✗ Error: Authentication failed. Check your token.")
-        else:
-            print(f"\n✗ HTTP Error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n✗ Unexpected error: {e}")
-        sys.exit(1)
+    sync = LuaBranchSync(token=args.token, output_dir=args.output_dir, cache_hours=args.cache_hours)
+    sync.run(args.source, args.target, missing_file=args.missing_file, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
