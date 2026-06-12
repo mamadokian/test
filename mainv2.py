@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Concurrent Lua Branch Sync
-Downloads {branch}.lua from source and uploads to target using thread pool.
+Concurrent Lua Branch Sync - with coordinated rate limiting
+Prevents all threads from sleeping simultaneously by sharing rate limit state.
 """
 
 import requests
@@ -17,6 +17,51 @@ from typing import Set, Optional, List
 from datetime import datetime
 
 
+class RateLimitManager:
+    """Shared rate limit state across all threads."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.remaining = 5000
+        self.reset_time = 0
+        self.sleeping_threads = 0
+    
+    def update(self, response: requests.Response):
+        with self.lock:
+            self.remaining = int(response.headers.get('X-RateLimit-Remaining', self.remaining))
+            self.reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
+    
+    def check_and_wait(self):
+        """
+        Check if we need to sleep. Only one thread sleeps at a time,
+        others wait for the wake signal.
+        """
+        with self.lock:
+            if self.remaining > 5:
+                self.remaining -= 1  # Reserve one for this request
+                return False  # No sleep needed
+            
+            # Need to sleep
+            now = time.time()
+            sleep_time = max(self.reset_time - now, 0) + 2
+            
+            if sleep_time <= 0:
+                self.remaining = 5000  # Reset should have happened
+                return False
+            
+            self.sleeping_threads += 1
+            thread_num = self.sleeping_threads
+        
+        # Sleep outside the lock so other threads can see the state
+        print(f"  ⏳ [{thread_num}] Rate limit exhausted. Sleeping {sleep_time:.0f}s until reset...")
+        time.sleep(sleep_time)
+        
+        with self.lock:
+            self.sleeping_threads -= 1
+            self.remaining = 5000  # Assume refreshed after sleep
+        
+        return True
+
+
 class LuaBranchSync:
     def __init__(self, token: str, output_dir: str = ".", cache_hours: int = 24, workers: int = 50):
         self.session = requests.Session()
@@ -28,29 +73,20 @@ class LuaBranchSync:
         self.output_dir = output_dir
         self.cache_hours = cache_hours
         self.workers = workers
+        self.rate_limit = RateLimitManager()
         os.makedirs(output_dir, exist_ok=True)
         
         self.progress_file = os.path.join(output_dir, "lua_sync_progress.json")
         self.lock = threading.Lock()
-        self.rate_limit_remaining = 5000
-
-    def _sleep_for_rate_limit(self, response: requests.Response):
-        self.rate_limit_remaining = int(response.headers.get('X-RateLimit-Remaining', 0))
-        if self.rate_limit_remaining < 5:
-            reset = int(response.headers.get('X-RateLimit-Reset', time.time() + 60))
-            sleep = max(reset - time.time(), 0) + 2
-            print(f"  ⏳ Rate limit low ({self.rate_limit_remaining}). Sleeping {sleep:.0f}s...")
-            time.sleep(sleep)
 
     def _get(self, url: str, params: dict = None) -> requests.Response:
         while True:
+            self.rate_limit.check_and_wait()
             resp = self.session.get(url, params=params or {}, timeout=30)
-            self._sleep_for_rate_limit(resp)
+            self.rate_limit.update(resp)
             
             if resp.status_code == 403 and 'rate limit' in resp.text.lower():
-                reset = int(resp.headers.get('X-RateLimit-Reset', time.time() + 60))
-                time.sleep(max(reset - time.time(), 0) + 1)
-                continue
+                continue  # Will sleep on next loop
             if resp.status_code == 404:
                 return resp
             resp.raise_for_status()
@@ -58,23 +94,21 @@ class LuaBranchSync:
 
     def _post(self, url: str, json_data: dict) -> requests.Response:
         while True:
+            self.rate_limit.check_and_wait()
             resp = self.session.post(url, json=json_data, timeout=30)
-            self._sleep_for_rate_limit(resp)
+            self.rate_limit.update(resp)
             
             if resp.status_code == 403 and 'rate limit' in resp.text.lower():
-                reset = int(resp.headers.get('X-RateLimit-Reset', time.time() + 60))
-                time.sleep(max(reset - time.time(), 0) + 1)
                 continue
             return resp
 
     def _put(self, url: str, json_data: dict) -> requests.Response:
         while True:
+            self.rate_limit.check_and_wait()
             resp = self.session.put(url, json=json_data, timeout=30)
-            self._sleep_for_rate_limit(resp)
+            self.rate_limit.update(resp)
             
             if resp.status_code == 403 and 'rate limit' in resp.text.lower():
-                reset = int(resp.headers.get('X-RateLimit-Reset', time.time() + 60))
-                time.sleep(max(reset - time.time(), 0) + 1)
                 continue
             return resp
 
@@ -171,6 +205,7 @@ class LuaBranchSync:
             f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}",
             timeout=10
         )
+        self.rate_limit.update(resp)
         return resp.status_code == 200
 
     def create_branch(self, owner: str, repo: str, branch: str, base_sha: str) -> bool:
@@ -190,6 +225,7 @@ class LuaBranchSync:
         
         existing_sha = None
         check = self.session.get(url, params={"ref": branch}, timeout=10)
+        self.rate_limit.update(check)
         if check.status_code == 200:
             existing_sha = check.json().get("sha")
         
@@ -205,42 +241,29 @@ class LuaBranchSync:
         return resp.status_code in (200, 201)
 
     def sync_one_branch(self, args: tuple) -> tuple:
-        """
-        Worker function for thread pool.
-        Returns: (branch_name, success: bool)
-        """
         src_owner, src_repo, tgt_owner, tgt_repo, branch, tgt_base_sha = args
         
         try:
-            # 1. Download .lua from source
             content = self.get_lua_content(src_owner, src_repo, branch)
             if content is None:
-                print(f"  ✗ {branch}: .lua file not found in source")
-                return branch, False
+                return branch, False, "lua_not_found"
             
-            # 2. Ensure branch exists in target
             if not self.branch_exists(tgt_owner, tgt_repo, branch):
                 if not self.create_branch(tgt_owner, tgt_repo, branch, tgt_base_sha):
-                    print(f"  ✗ {branch}: failed to create branch")
-                    return branch, False
+                    return branch, False, "create_branch_failed"
             
-            # 3. Upload to target
             if not self.upload_lua(tgt_owner, tgt_repo, branch, content):
-                print(f"  ✗ {branch}: upload failed")
-                return branch, False
+                return branch, False, "upload_failed"
             
-            print(f"  ✓ {branch}")
-            return branch, True
+            return branch, True, "ok"
             
         except Exception as e:
-            print(f"  ✗ {branch}: {e}")
-            return branch, False
+            return branch, False, str(e)
 
     def run(self, source: str, target: str, missing_file: str = None, dry_run: bool = False):
         src_owner, src_repo = source.split("/")
         tgt_owner, tgt_repo = target.split("/")
         
-        # Determine branches to sync
         if missing_file:
             missing = sorted(self.load_missing_branches(missing_file))
             print(f"\n{'='*60}")
@@ -264,27 +287,21 @@ class LuaBranchSync:
         
         if dry_run:
             print(f"[DRY RUN] Would sync {len(missing)} branches with {self.workers} workers")
-            for b in missing[:10]:
-                print(f"  - {b}.lua")
-            if len(missing) > 10:
-                print(f"  ... and {len(missing)-10} more")
             return
         
-        # Get target base SHA once
         print("Getting target base SHA...")
         tgt_base_sha = self.get_default_branch_sha(tgt_owner, tgt_repo)
         print(f"  Base: {tgt_base_sha[:7]}...\n")
         
-        # Load progress
         progress = self.load_progress()
         completed = set(progress.get("completed", []))
         failed = list(progress.get("failed", []))
         
         to_process = [b for b in missing if b not in completed]
         print(f"Resume: {len(completed)} done, {len(to_process)} remaining")
-        print(f"Workers: {self.workers}\n")
+        print(f"Workers: {self.workers}")
+        print(f"Rate limit: 5,000/hour shared across all threads\n")
         
-        # Build arg tuples for workers
         worker_args = [
             (src_owner, src_repo, tgt_owner, tgt_repo, branch, tgt_base_sha)
             for branch in to_process
@@ -304,32 +321,32 @@ class LuaBranchSync:
                 for future in concurrent.futures.as_completed(future_to_branch):
                     branch = future_to_branch[future]
                     try:
-                        _, success = future.result()
+                        _, success, reason = future.result()
                     except Exception as e:
-                        print(f"  ✗ {branch}: Exception - {e}")
-                        success = False
+                        success, reason = False, str(e)
                     
                     with self.lock:
                         if success:
                             completed.add(branch)
                             completed_new += 1
+                            print(f"  ✓ {branch}")
                         else:
-                            failed.append(branch)
+                            failed.append({"branch": branch, "reason": reason})
                             failed_new += 1
+                            print(f"  ✗ {branch}: {reason}")
                         
                         processed_since_save += 1
                         
-                        # Save progress every 50 branches
                         if processed_since_save >= 50:
                             self.save_progress({
                                 "completed": sorted(list(completed)), 
                                 "failed": failed
                             })
-                            print(f"  💾 Progress saved ({len(completed)}/{len(missing)} total done)")
+                            print(f"  💾 Progress saved ({len(completed)}/{len(missing)} total)")
                             processed_since_save = 0
                         
         except KeyboardInterrupt:
-            print("\n\n⚠ Interrupted by user.")
+            print("\n\n⚠ Interrupted.")
         finally:
             self.save_progress({
                 "completed": sorted(list(completed)), 
@@ -347,16 +364,16 @@ class LuaBranchSync:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Concurrent .lua branch sync. Downloads {branch}.lua and uploads to target."
+        description="Concurrent .lua branch sync with coordinated rate limiting."
     )
     parser.add_argument("source", help="Source repo (owner/repo)")
     parser.add_argument("target", help="Target repo (owner/repo)")
     parser.add_argument("--token", "-t", required=True, help="GitHub token")
-    parser.add_argument("--missing-file", "-m", help="Path to missing_branches JSON (skips repo comparison)")
+    parser.add_argument("--missing-file", "-m", help="Path to missing_branches JSON")
     parser.add_argument("--output-dir", "-o", default=".", help="Cache/progress directory")
     parser.add_argument("--dry-run", "-d", action="store_true", help="Preview only")
     parser.add_argument("--cache-hours", "-c", type=int, default=24, help="Branch cache max age")
-    parser.add_argument("--workers", "-w", type=int, default=50, help="Concurrent threads (default: 50)")
+    parser.add_argument("--workers", "-w", type=int, default=50, help="Concurrent threads")
     
     args = parser.parse_args()
     
@@ -368,7 +385,7 @@ def main():
     )
     
     print("=" * 60)
-    print("Concurrent Lua Branch Sync")
+    print("Concurrent Lua Branch Sync (Coordinated Rate Limit)")
     print("=" * 60)
     print(f"Source:  {args.source}")
     print(f"Target:  {args.target}")
