@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-GitHub Branch Sync Tool
-Compares branches between two repos and syncs missing ones from repo1 to repo2.
-Optimized for repositories with large numbers of branches (100k+).
-Now saves results to files.
+GitHub Branch Sync Tool - CACHE-FIRST VERSION
+Reads saved branch lists from JSON first. Only hits the API if cache is missing or expired.
 """
 
 import requests
@@ -13,12 +11,11 @@ import json
 import time
 import os
 from typing import Set, List, Dict, Optional
-from urllib.parse import urljoin
 from datetime import datetime
 
 
 class GitHubBranchSync:
-    def __init__(self, token: Optional[str] = None, output_dir: str = "."):
+    def __init__(self, token: Optional[str] = None, output_dir: str = ".", cache_max_age_hours: int = 24):
         self.base_url = "https://api.github.com"
         self.session = requests.Session()
         self.session.headers.update({
@@ -31,18 +28,47 @@ class GitHubBranchSync:
         self.rate_limit_remaining = 5000
         self.rate_limit_reset = 0
         self.output_dir = output_dir
+        self.cache_max_age_hours = cache_max_age_hours
         os.makedirs(output_dir, exist_ok=True)
 
+    def _get_cache_path(self, owner: str, repo: str) -> str:
+        return os.path.join(self.output_dir, f"{owner}_{repo}_branches.json")
+
     def _save_json(self, filename: str, data: dict):
-        """Save data to a JSON file in the output directory."""
         filepath = os.path.join(self.output_dir, filename)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         print(f"  💾 Saved to {filepath}")
         return filepath
 
+    def load_saved_branches(self, owner: str, repo: str) -> Optional[Set[str]]:
+        """Load branches from saved JSON if it exists and isn't too old."""
+        filepath = self._get_cache_path(owner, repo)
+        
+        if not os.path.exists(filepath):
+            return None
+        
+        try:
+            mtime = os.path.getmtime(filepath)
+            age_hours = (time.time() - mtime) / 3600
+            
+            if age_hours > self.cache_max_age_hours:
+                print(f"  ⚠ Cache file is {age_hours:.1f}h old (max {self.cache_max_age_hours}h), refetching...")
+                return None
+            
+            print(f"  📂 Loading cached branches from {filepath}...")
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            branches = set(data.get("branches", []))
+            print(f"  ✓ Loaded {len(branches)} branches from cache (age: {age_hours:.1f}h)")
+            return branches
+            
+        except (json.JSONDecodeError, KeyError, OSError) as e:
+            print(f"  ⚠ Failed to read cache: {e}, refetching...")
+            return None
+
     def _check_rate_limit(self, response: requests.Response):
-        """Update rate limit tracking from response headers."""
         self.rate_limit_remaining = int(response.headers.get('X-RateLimit-Remaining', 0))
         self.rate_limit_reset = int(response.headers.get('X-RateLimit-Reset', 0))
         
@@ -52,7 +78,6 @@ class GitHubBranchSync:
             time.sleep(sleep_time)
 
     def _get(self, url: str, params: Dict = None) -> requests.Response:
-        """Make authenticated GET request with rate limit handling."""
         response = self.session.get(url, params=params or {}, timeout=30)
         self._check_rate_limit(response)
         
@@ -66,21 +91,14 @@ class GitHubBranchSync:
         return response
 
     def get_all_branches(self, owner: str, repo: str, per_page: int = 100) -> Set[str]:
-        """
-        Fetch all branch names from a repository using pagination.
-        Returns a set of branch names for O(1) lookup performance.
-        """
         branches = set()
         page = 1
         
-        print(f"Fetching branches from {owner}/{repo}...")
+        print(f"Fetching branches from {owner}/{repo} via API...")
         
         while True:
             url = f"{self.base_url}/repos/{owner}/{repo}/branches"
-            params = {
-                "per_page": per_page,
-                "page": page
-            }
+            params = {"per_page": per_page, "page": page}
             
             try:
                 response = self._get(url, params)
@@ -97,7 +115,6 @@ class GitHubBranchSync:
                 
                 page += 1
                 
-                # Progress indicator for large repos
                 if page % 10 == 0:
                     print(f"  ... fetched {len(branches)} branches so far (page {page})")
                     
@@ -105,27 +122,22 @@ class GitHubBranchSync:
                 print(f"Error fetching page {page}: {e}")
                 raise
         
-        print(f"Total branches in {owner}/{repo}: {len(branches)}")
+        print(f"Total branches fetched from API: {len(branches)}")
         
-        # Save branches to file
         self._save_json(
             f"{owner}_{repo}_branches.json",
             {
                 "repository": f"{owner}/{repo}",
                 "total_count": len(branches),
                 "branches": sorted(list(branches)),
-                "fetched_at": datetime.utcnow().isoformat() + "Z"
+                "fetched_at": datetime.utcnow().isoformat() + "Z",
+                "method": "rest_api"
             }
         )
         
         return branches
 
     def get_all_branches_graphql(self, owner: str, repo: str) -> Set[str]:
-        """
-        Alternative: Use GraphQL for potentially faster fetching with cursor pagination.
-        More efficient for very large repositories (100k+ branches).
-        Requires token with appropriate scopes.
-        """
         if "Authorization" not in self.session.headers:
             print("No token provided, falling back to REST API...")
             return self.get_all_branches(owner, repo)
@@ -190,9 +202,8 @@ class GitHubBranchSync:
                 print(f"GraphQL error: {e}, falling back to REST API...")
                 return self.get_all_branches(owner, repo)
         
-        print(f"Total branches in {owner}/{repo}: {len(branches)}")
+        print(f"Total branches fetched via GraphQL: {len(branches)}")
         
-        # Save branches to file
         self._save_json(
             f"{owner}_{repo}_branches.json",
             {
@@ -206,21 +217,23 @@ class GitHubBranchSync:
         
         return branches
 
-    def branch_exists(self, owner: str, repo: str, branch: str) -> bool:
-        """Check if a specific branch exists (lightweight check)."""
-        url = f"{self.base_url}/repos/{owner}/{repo}/git/ref/heads/{branch}"
-        response = self.session.get(url)
-        return response.status_code == 200
+    def get_default_branch_sha(self, owner: str, repo: str) -> str:
+        url = f"{self.base_url}/repos/{owner}/{repo}"
+        response = self._get(url)
+        default_branch = response.json().get('default_branch', 'main')
+        
+        ref_url = f"{self.base_url}/repos/{owner}/{repo}/git/ref/heads/{default_branch}"
+        ref_response = self._get(ref_url)
+        sha = ref_response.json()['object']['sha']
+        
+        print(f"Target default branch: {default_branch} @ {sha[:7]}...")
+        return sha
 
-    def create_branch(self, owner: str, repo: str, branch_name: str, source_sha: str) -> bool:
-        """
-        Create a new branch in the target repository.
-        Returns True if successful, False otherwise.
-        """
+    def create_branch(self, owner: str, repo: str, branch_name: str, base_sha: str) -> bool:
         url = f"{self.base_url}/repos/{owner}/{repo}/git/refs"
         payload = {
             "ref": f"refs/heads/{branch_name}",
-            "sha": source_sha
+            "sha": base_sha
         }
         
         try:
@@ -241,15 +254,19 @@ class GitHubBranchSync:
             print(f"  ✗ Error creating {branch_name}: {e}")
             return False
 
-    def get_branch_sha(self, owner: str, repo: str, branch: str) -> Optional[str]:
-        """Get the SHA of the latest commit on a branch."""
-        url = f"{self.base_url}/repos/{owner}/{repo}/git/ref/heads/{branch}"
-        try:
-            response = self._get(url)
-            return response.json()['object']['sha']
-        except (requests.exceptions.RequestException, KeyError) as e:
-            print(f"Error getting SHA for {branch}: {e}")
-            return None
+    def get_branches(self, owner: str, repo: str, use_graphql: bool = False) -> Set[str]:
+        """
+        CACHE-FIRST: Try to load from JSON file first.
+        Only hits the API if no valid cache exists.
+        """
+        cached = self.load_saved_branches(owner, repo)
+        if cached is not None:
+            return cached
+        
+        if use_graphql:
+            return self.get_all_branches_graphql(owner, repo)
+        else:
+            return self.get_all_branches(owner, repo)
 
     def sync_branches(
         self,
@@ -260,10 +277,6 @@ class GitHubBranchSync:
         dry_run: bool = False,
         use_graphql: bool = False
     ) -> Dict[str, any]:
-        """
-        Main sync logic: find branches in source but not in target, create them in target.
-        Returns statistics about the sync operation.
-        """
         stats = {
             "source_branches": 0,
             "target_branches": 0,
@@ -273,22 +286,20 @@ class GitHubBranchSync:
             "skipped": 0
         }
         
-        # Fetch branches from both repos
-        if use_graphql:
-            source_branches = self.get_all_branches_graphql(source_owner, source_repo)
-            target_branches = self.get_all_branches_graphql(target_owner, target_repo)
-        else:
-            source_branches = self.get_all_branches(source_owner, source_repo)
-            target_branches = self.get_all_branches(target_owner, target_repo)
+        # CACHE-FIRST: Load from JSON if available, else fetch from API
+        print(f"\n[Source] {source_owner}/{source_repo}")
+        source_branches = self.get_branches(source_owner, source_repo, use_graphql=use_graphql)
+        
+        print(f"\n[Target] {target_owner}/{target_repo}")
+        target_branches = self.get_branches(target_owner, target_repo, use_graphql=use_graphql)
         
         stats["source_branches"] = len(source_branches)
         stats["target_branches"] = len(target_branches)
         
-        # Find missing branches (O(1) set difference)
+        # Find missing branches
         missing = source_branches - target_branches
         stats["missing_branches"] = len(missing)
         
-        # Save missing branches to file
         if missing:
             self._save_json(
                 f"missing_branches_{source_owner}_{source_repo}_to_{target_owner}_{target_repo}.json",
@@ -311,6 +322,8 @@ class GitHubBranchSync:
         
         print(f"\nFound {len(missing)} branches to sync from {source_owner}/{source_repo} to {target_owner}/{target_repo}")
         
+        target_base_sha = self.get_default_branch_sha(target_owner, target_repo)
+        
         if dry_run:
             print("\n[DRY RUN] Would create the following branches:")
             for branch in sorted(missing):
@@ -322,29 +335,14 @@ class GitHubBranchSync:
             )
             return stats
         
-        # Get default branch SHA from source to use as base for new branches
-        default_branch = self._get_default_branch(source_owner, source_repo)
-        print(f"Using default branch '{default_branch}' as reference for new branches")
-        
-        # Create missing branches in target
-        print("\nSyncing branches...")
+        print(f"\nSyncing branches (all pointing to {target_base_sha[:7]}...)")
         created_branches = []
         failed_branches = []
         
         for i, branch in enumerate(sorted(missing), 1):
             print(f"[{i}/{len(missing)}] Processing: {branch}")
             
-            # Get the actual SHA from the source branch (preserves branch state)
-            source_sha = self.get_branch_sha(source_owner, source_repo, branch)
-            
-            if not source_sha:
-                print(f"  ✗ Could not get SHA for source branch {branch}, skipping...")
-                stats["skipped"] += 1
-                failed_branches.append({"branch": branch, "reason": "sha_not_found"})
-                continue
-            
-            # Create branch in target
-            success = self.create_branch(target_owner, target_repo, branch, source_sha)
+            success = self.create_branch(target_owner, target_repo, branch, target_base_sha)
             if success:
                 stats["created"] += 1
                 created_branches.append(branch)
@@ -352,16 +350,15 @@ class GitHubBranchSync:
                 stats["failed"] += 1
                 failed_branches.append({"branch": branch, "reason": "api_error"})
             
-            # Small delay to avoid hitting rate limits too hard
             time.sleep(0.1)
         
-        # Save final results
         self._save_json(
             f"sync_result_{source_owner}_{source_repo}_to_{target_owner}_{target_repo}.json",
             {
                 "source": f"{source_owner}/{source_repo}",
                 "target": f"{target_owner}/{target_repo}",
                 "timestamp": datetime.utcnow().isoformat() + "Z",
+                "base_sha": target_base_sha,
                 "stats": stats,
                 "created_branches": created_branches,
                 "failed_branches": failed_branches
@@ -370,15 +367,8 @@ class GitHubBranchSync:
         
         return stats
 
-    def _get_default_branch(self, owner: str, repo: str) -> str:
-        """Get the default branch name of a repository."""
-        url = f"{self.base_url}/repos/{owner}/{repo}"
-        response = self._get(url)
-        return response.json().get('default_branch', 'main')
-
 
 def parse_repo_string(repo_str: str) -> tuple:
-    """Parse 'owner/repo' format."""
     parts = repo_str.split('/')
     if len(parts) != 2:
         raise ValueError(f"Invalid repo format '{repo_str}'. Expected 'owner/repo'.")
@@ -387,61 +377,34 @@ def parse_repo_string(repo_str: str) -> tuple:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sync missing branches from one GitHub repo to another."
+        description="Sync missing branches from one GitHub repo to another. Reads cached JSON first, API only if needed."
     )
-    parser.add_argument(
-        "source",
-        help="Source repository (format: owner/repo)"
-    )
-    parser.add_argument(
-        "target",
-        help="Target repository (format: owner/repo)"
-    )
-    parser.add_argument(
-        "--token", "-t",
-        help="GitHub Personal Access Token (required for private repos, recommended for public to avoid rate limits)"
-    )
-    parser.add_argument(
-        "--dry-run", "-d",
-        action="store_true",
-        help="Show what would be synced without making changes"
-    )
-    parser.add_argument(
-        "--graphql", "-g",
-        action="store_true",
-        help="Use GraphQL API (faster for very large repos, requires token)"
-    )
-    parser.add_argument(
-        "--per-page",
-        type=int,
-        default=100,
-        help="Number of branches per page (max 100, default 100)"
-    )
-    parser.add_argument(
-        "--output-dir", "-o",
-        default=".",
-        help="Directory to save result files (default: current directory)"
-    )
+    parser.add_argument("source", help="Source repository (format: owner/repo)")
+    parser.add_argument("target", help="Target repository (format: owner/repo)")
+    parser.add_argument("--token", "-t", help="GitHub Personal Access Token")
+    parser.add_argument("--dry-run", "-d", action="store_true", help="Show what would be synced without making changes")
+    parser.add_argument("--graphql", "-g", action="store_true", help="Use GraphQL API")
+    parser.add_argument("--output-dir", "-o", default=".", help="Directory to save result files")
+    parser.add_argument("--cache-hours", "-c", type=int, default=24, help="Max age of cache files in hours before refetching (default: 24)")
     
     args = parser.parse_args()
     
-    # Parse repo strings
     source_owner, source_repo = parse_repo_string(args.source)
     target_owner, target_repo = parse_repo_string(args.target)
     
-    # Initialize sync tool
-    sync = GitHubBranchSync(token=args.token, output_dir=args.output_dir)
+    sync = GitHubBranchSync(token=args.token, output_dir=args.output_dir, cache_max_age_hours=args.cache_hours)
     
     print("=" * 60)
-    print("GitHub Branch Sync Tool")
+    print("GitHub Branch Sync Tool (CACHE-FIRST)")
     print("=" * 60)
     print(f"Source: {source_owner}/{source_repo}")
     print(f"Target: {target_owner}/{target_repo}")
+    print(f"Cache max age: {args.cache_hours} hours")
     print(f"Mode: {'GraphQL' if args.graphql else 'REST API'}")
     print(f"Dry Run: {'Yes' if args.dry_run else 'No'}")
     print(f"Output Dir: {args.output_dir}")
     if not args.token:
-        print("Warning: No token provided. Rate limit is 60 requests/hour for public repos.")
+        print("Warning: No token provided. Rate limit is 60 requests/hour.")
     print("=" * 60)
     
     try:
@@ -456,7 +419,7 @@ def main():
         print("SYNC SUMMARY")
         print("=" * 60)
         print(f"Source branches:      {stats['source_branches']:,}")
-        print(f"Target branches:      {stats['target_branches']:,}")
+        print(f"Target branches:        {stats['target_branches']:,}")
         print(f"Missing branches:     {stats['missing_branches']:,}")
         if not args.dry_run:
             print(f"Created:              {stats['created']:,}")
@@ -467,8 +430,6 @@ def main():
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
             print("\n✗ Error: Repository not found or not accessible.")
-            print("  - Check that the repo names are correct")
-            print("  - For private repos, provide a valid token")
         elif e.response.status_code == 401:
             print("\n✗ Error: Authentication failed. Check your token.")
         else:
